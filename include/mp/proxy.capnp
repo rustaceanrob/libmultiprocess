@@ -40,26 +40,11 @@ annotation name(field, method): Text;
 annotation skip(field): Void;
 # Synonym for count(0).
 
-interface ThreadMap $count(0) {
-    # Interface letting clients control which thread a method call should
-    # execute on. Clients create and name threads and pass the thread handle as
-    # a call parameter.
-    makeThread @0 (name :Text) -> (result :Thread);
-}
-
-interface Thread {
-    # Thread handle returned by makeThread corresponding to one server thread.
-
-    getName @0 () -> (result: Text);
-}
-
 struct Context $count(0) {
    # Execution context passed as a parameter from the client class to the server class.
 
-   thread @0 : Thread;
-   # Handle of the server thread the current method call should execute on.
-
-   callbackThread @1 : Thread;
-   # Handle of the client thread that is calling the current method, and that
-   # any callbacks made by the server thread should be made on.
+   clientThreadId @0 : UInt64;
+   # Stable numeric ID of the client thread originating this call. The receiver
+   # uses this to route the request to the appropriate local worker thread,
+   # maintaining affinity across nested calls and callbacks.
 }

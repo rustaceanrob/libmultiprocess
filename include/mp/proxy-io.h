@@ -71,33 +71,14 @@ struct ServerInvokeContext : InvokeContext
 template <typename Interface, typename Params, typename Results>
 using ServerContext = ServerInvokeContext<ProxyServer<Interface>, ::capnp::CallContext<Params, Results>>;
 
-template <>
-struct ProxyClient<Thread> : public ProxyClientBase<Thread, ::capnp::Void>
-{
-    using ProxyClientBase::ProxyClientBase;
-    // https://stackoverflow.com/questions/22357887/comparing-two-mapiterators-why-does-it-need-the-copy-constructor-of-stdpair
-    ProxyClient(const ProxyClient&) = delete;
-    ~ProxyClient();
-
-    //! Reference to callback function that is run if there is a sudden
-    //! disconnect and the Connection object is destroyed before this
-    //! ProxyClient<Thread> object. The callback will destroy this object and
-    //! remove its entry from the thread's request_threads or callback_threads
-    //! map. It will also reset m_disconnect_cb so the destructor does not
-    //! access it. In the normal case where there is no sudden disconnect, the
-    //! destructor will unregister m_disconnect_cb so the callback is never run.
-    //! Since this variable is accessed from multiple threads, accesses should
-    //! be guarded with the associated Waiter::m_mutex.
-    std::optional<CleanupIt> m_disconnect_cb;
-};
-
-template <>
-struct ProxyServer<Thread> final : public Thread::Server
+//! Worker thread used by the server-side thread pool and by the client side to
+//! provide a post() target for incoming callbacks. Inherits kj::Refcounted so
+//! in-flight post() chains can hold a self-reference that outlives the pool.
+class WorkerThread : public kj::Refcounted
 {
 public:
-    ProxyServer(Connection& connection, ThreadContext& thread_context, std::thread&& thread);
-    ~ProxyServer();
-    kj::Promise<void> getName(GetNameContext context) override;
+    WorkerThread(Connection& connection, ThreadContext& thread_context, std::thread&& thread);
+    ~WorkerThread();
 
     //! Run a callback function fn returning T on this thread. The function will
     //! be queued and executed as soon as the thread is idle, and when fn
@@ -113,6 +94,13 @@ public:
     //! post() callback function waiting to execute.
     kj::Promise<void> m_thread_ready{kj::READY_NOW};
 };
+
+//! Create a WorkerThread for client_thread_id, register it in
+//! connection.m_thread_assignments, and return a reference to it.
+WorkerThread& MakeWorkerThread(Connection& connection, uint64_t client_thread_id);
+
+//! Return a new unique ID for use as a clientThreadId.
+uint64_t NextClientThreadId();
 
 //! Handler for kj::TaskSet failed task events.
 class LoggingErrorHandler : public kj::TaskSet::ErrorHandler
@@ -341,14 +329,6 @@ public:
     //! External context pointer.
     void* m_context;
 
-    //! Hook called when ProxyServer<ThreadMap>::makeThread() is called.
-    std::function<void()> testing_hook_makethread;
-
-    //! Hook called on the worker thread inside makeThread(), after the thread
-    //! context is set up and thread_context promise is fulfilled, but before it
-    //! starts waiting for requests.
-    std::function<void()> testing_hook_makethread_created;
-
     //! Hook called on the worker thread when it starts to execute an async
     //! request. Used by tests to control timing or inject behavior at this
     //! point in execution.
@@ -469,13 +449,15 @@ public:
     ::capnp::TwoPartyVatNetwork m_network;
     std::optional<::capnp::RpcSystem<::capnp::rpc::twoparty::VatId>> m_rpc_system;
 
-    // ThreadMap interface client, used to create a remote server thread when an
-    // client IPC call is being made for the first time from a new thread.
-    ThreadMap::Client m_thread_map{nullptr};
+    //! Pool of worker threads for server-side dispatch. Grown lazily when a new
+    //! clientThreadId is first seen.
+    std::vector<kj::Own<WorkerThread>> m_thread_pool;
 
-    //! Collection of server-side IPC worker threads (ProxyServer<Thread> objects previously returned by
-    //! ThreadMap.makeThread) used to service requests to clients.
-    ::capnp::CapabilityServerSet<Thread> m_threads;
+    //! Routing map used by PassField on both sides of a connection.
+    //! Server side: clientThreadId -> pool thread (assigned on first use).
+    //! Client side: clientThreadId -> callback proxy thread (registered by
+    //! CustomBuildField on the first IPC call from each application thread).
+    std::map<uint64_t, WorkerThread*> m_thread_assignments;
 
     //! Canceler for canceling promises that we want to discard when the
     //! connection is destroyed. This is used to interrupt method calls that are
@@ -644,84 +626,34 @@ void ProxyServerBase<Interface, Impl>::invokeDestroy()
     CleanupRun(m_context.cleanup_fns);
 }
 
-//! Map from Connection to local or remote thread handle which will be used over
-//! that connection. This map will typically only contain one entry, but can
-//! contain multiple if a single thread makes IPC calls over multiple
-//! connections. A std::optional value type is used to avoid the map needing to
-//! be locked while ProxyClient<Thread> objects are constructed, see
-//! ThreadContext "Synchronization note" below.
-using ConnThreads = std::map<Connection*, std::optional<ProxyClient<Thread>>>;
-using ConnThread = ConnThreads::iterator;
-
-// Retrieve ProxyClient<Thread> object associated with this connection from a
-// map, or create a new one and insert it into the map. Return map iterator and
-// inserted bool.
-std::tuple<ConnThread, bool> SetThread(GuardedRef<ConnThreads> threads, Connection* connection, const std::function<Thread::Client()>& make_thread);
-
 //! The thread_local ThreadContext g_thread_context struct provides information
 //! about individual threads and a way of communicating between them. Because
 //! it's a thread local struct, each ThreadContext instance is initialized by
 //! the thread that owns it.
 //!
-//! ThreadContext is used for any client threads created externally which make
-//! IPC calls, and for server threads created by
-//! ProxyServer<ThreadMap>::makeThread() which execute IPC calls for clients.
-//!
-//! In both cases, the struct holds information like the thread name, and a
-//! Waiter object where the EventLoop can post incoming IPC requests to execute
-//! on the thread. The struct also holds ConnThread maps associating the thread
-//! with local and remote ProxyClient<Thread> objects.
+//! ThreadContext is used for application client threads making IPC calls, and
+//! for pool worker threads on the server side executing those calls.
 struct ThreadContext
 {
     //! Identifying string for debug.
     std::string thread_name;
 
-    //! Waiter object used to allow remote clients to execute code on this
-    //! thread. For server threads created by
-    //! ProxyServer<ThreadMap>::makeThread(), this is initialized in that
-    //! function. Otherwise, for client threads created externally, this is
-    //! initialized the first time the thread tries to make an IPC call. Having
-    //! a waiter is necessary for threads making IPC calls in case a server they
-    //! are calling expects them to execute a callback during the call, before
-    //! it sends a response.
-    //!
-    //! For IPC client threads, the Waiter pointer is never cleared and the Waiter
-    //! just gets destroyed when the thread does. For server threads created by
-    //! makeThread(), this pointer is set to null in the ~ProxyServer<Thread> as
-    //! a signal for the thread to exit and destroy itself. In both cases, the
-    //! same Waiter object is used across different calls and only created and
-    //! destroyed once for the lifetime of the thread.
+    //! Waiter object used to allow the event loop to post work to this thread.
+    //! Initialized lazily on first IPC call for application threads, and during
+    //! pool thread creation for server worker threads. For pool threads, set to
+    //! null by ~ProxyServer<Thread> as the shutdown signal.
     std::unique_ptr<Waiter> waiter = nullptr;
 
-    //! When client is making a request to a server, this is the
-    //! `callbackThread` argument it passes in the request, used by the server
-    //! in case it needs to make callbacks into the client that need to execute
-    //! while the client is waiting. This will be set to a local thread object.
-    //!
-    //! Synchronization note: The callback_thread and request_thread maps are
-    //! only ever accessed internally by this thread's destructor and externally
-    //! by Cap'n Proto event loop threads. Since it's possible for IPC client
-    //! threads to make calls over different connections that could have
-    //! different event loops, these maps are guarded by Waiter::m_mutex in case
-    //! different event loop threads add or remove map entries simultaneously.
-    //! However, individual ProxyClient<Thread> objects in the maps will only be
-    //! associated with one event loop and guarded by EventLoop::m_mutex. So
-    //! Waiter::m_mutex does not need to be held while accessing individual
-    //! ProxyClient<Thread> instances, and may even need to be released to
-    //! respect lock order and avoid locking Waiter::m_mutex before
-    //! EventLoop::m_mutex.
-    ConnThreads callback_threads MP_GUARDED_BY(waiter->m_mutex);
+    //! Stable numeric identity for application client threads. Generated lazily
+    //! from a global atomic counter on the first IPC call made by this thread.
+    //! Zero on server-side pool threads (they use serving_client_ids instead).
+    uint64_t thread_id = 0;
 
-    //! When client is making a request to a server, this is the `thread`
-    //! argument it passes in the request, used to control which thread on
-    //! server will be responsible for executing it. If client call is being
-    //! made from a local thread, this will be a remote thread object returned
-    //! by makeThread. If a client call is being made from a thread currently
-    //! handling a server request, this will be set to the `callbackThread`
-    //! request thread argument passed in that request.
-    //!
-    //! Synchronization note: \ref callback_threads note applies here as well.
-    ConnThreads request_threads MP_GUARDED_BY(waiter->m_mutex);
+    //! For server-side pool worker threads: the clientThreadId of the request
+    //! currently executing on this thread, keyed by Connection. Set by
+    //! PassField on entry and cleared on exit. Guarded by waiter->m_mutex
+    //! since the event loop thread may read it when routing callbacks.
+    std::map<Connection*, uint64_t> serving_client_ids MP_GUARDED_BY(waiter->m_mutex);
 
     //! Whether this thread is a capnp event loop thread. Not really used except
     //! to assert false if there's an attempt to execute a blocking operation
@@ -730,17 +662,15 @@ struct ThreadContext
 };
 
 template<typename T, typename Fn>
-kj::Promise<T> ProxyServer<Thread>::post(Fn&& fn)
+kj::Promise<T> WorkerThread::post(Fn&& fn)
 {
     auto ready = kj::newPromiseAndFulfiller<void>(); // Signaled when waiter is ready to post again.
     auto cancel_monitor_ptr = kj::heap<CancelMonitor>();
     CancelMonitor& cancel_monitor = *cancel_monitor_ptr;
-    // Keep a reference to the ProxyServer<Thread> instance by assigning it to
-    // the self variable. ProxyServer instances are reference-counted and if the
-    // client drops its reference, this variable keeps the instance alive until
-    // the thread finishes executing. The self variable needs to be destroyed on
-    // the event loop thread so it is freed in a sync() call below.
-    auto self = thisCap();
+    // Keep a reference to this WorkerThread so in-flight post() chains outlive
+    // pool destruction. Destroyed via evalLater on the event loop thread to
+    // avoid joining the worker thread from within a sync() call.
+    auto self = kj::addRef(*this);
     auto ret = m_thread_ready.then([this, self = std::move(self), fn = std::forward<Fn>(fn), ready_fulfiller = kj::mv(ready.fulfiller), cancel_monitor_ptr = kj::mv(cancel_monitor_ptr)]() mutable {
         auto result = kj::newPromiseAndFulfiller<T>(); // Signaled when fn() is called, with its return value.
         bool posted = m_thread_context.waiter->post([this, self = std::move(self), fn = std::forward<Fn>(fn), ready_fulfiller = kj::mv(ready_fulfiller), result_fulfiller = kj::mv(result.fulfiller), cancel_monitor_ptr = kj::mv(cancel_monitor_ptr)]() mutable {
@@ -775,10 +705,10 @@ kj::Promise<T> ProxyServer<Thread>::post(Fn&& fn)
                     result_value.reset();
                 }
                 result_fulfiller = nullptr;
-                // Use evalLater to destroy the ProxyServer<Thread> self
-                // reference, if it is the last reference, because the
-                // ProxyServer<Thread> destructor needs to join the thread,
-                // which can't happen until this sync() block has exited.
+                // Use evalLater to destroy the WorkerThread self reference, if
+                // it is the last reference, because the WorkerThread destructor
+                // needs to join the thread, which can't happen until this
+                // sync() block has exited.
                 m_loop->m_task_set->add(kj::evalLater([self = kj::mv(self)] {}));
             });
         });

@@ -13,7 +13,6 @@
 #include <mp/type-decay.h>
 #include <mp/type-interface.h>
 #include <mp/type-string.h>
-#include <mp/type-threadmap.h>
 // IWYU pragma: end_exports
 
 struct InitInterface; // IWYU pragma: export

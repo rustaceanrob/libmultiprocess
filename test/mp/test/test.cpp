@@ -182,7 +182,6 @@ KJ_TEST("Call FooInterface methods")
         int m_expect, m_ret;
     };
 
-    foo->initThreadMap();
     Callback callback(1, 2);
     KJ_EXPECT(foo->callback(callback, 1) == 2);
     KJ_EXPECT(foo->callbackUnique(std::make_unique<Callback>(3, 4), 3) == 4);
@@ -284,30 +283,13 @@ KJ_TEST("Calling IPC method and disconnecting during the call")
 
 KJ_TEST("Calling IPC method, disconnecting and blocking during the call")
 {
-    // This test is similar to last test, except that instead of letting the IPC
-    // call return immediately after triggering a disconnect, make it disconnect
-    // & wait so server is forced to deal with having a disconnection and call
-    // in flight at the same time.
-    //
-    // Test uses callFnAsync() instead of callFn() to implement this. Both of
-    // these methods have the same implementation, but the callFnAsync() capnp
-    // method declaration takes an mp.Context argument so the method executes on
-    // an asynchronous thread instead of executing in the event loop thread, so
-    // it is able to block without deadlocking the event lock thread.
-    //
-    // This test adds important coverage because it causes the server Connection
-    // object to be destroyed before ProxyServer object, which is not a
-    // condition that usually happens because the m_rpc_system.reset() call in
-    // the ~Connection destructor usually would immediately free all remaining
-    // ProxyServer objects associated with the connection. Having an in-progress
-    // RPC call requires keeping the ProxyServer longer.
-
+    // Uses callFnAsync() (which has a Context parameter) so the method executes
+    // on a worker thread and can block without deadlocking the event loop thread.
     std::promise<void> signal;
     TestSetup setup{/*client_owns_connection=*/false};
     ProxyClient<messages::FooInterface>* foo = setup.client.get();
     KJ_EXPECT(foo->add(1, 2) == 3);
 
-    foo->initThreadMap();
     setup.server->m_impl->m_fn = [&] {
         EventLoopRef loop{*setup.server->m_context.loop};
         setup.client_disconnect();
@@ -323,70 +305,18 @@ KJ_TEST("Calling IPC method, disconnecting and blocking during the call")
     }
     KJ_EXPECT(disconnected);
 
-    // Now that the disconnect has been detected, set signal allowing the
-    // callFnAsync() IPC call to return. Since signalling may not wake up the
-    // thread right away, it is important for the signal variable to be declared
-    // *before* the TestSetup variable so is not destroyed while
-    // signal.get_future().get() is called.
     signal.set_value();
-}
-
-KJ_TEST("Worker thread destroyed before it is initialized")
-{
-    // Regression test for bitcoin/bitcoin#34711, bitcoin/bitcoin#34756 where a
-    // worker thread is destroyed before it starts waiting for work.
-    //
-    // The test uses the `makethread` hook to trigger a disconnect as soon as
-    // ProxyServer<ThreadMap>::makeThread is called, so without the bugfix,
-    // ProxyServer<Thread>::~ProxyServer would run and destroy the waiter before
-    // the worker thread started waiting, causing a SIGSEGV when it did start.
-    TestSetup setup;
-    ProxyClient<messages::FooInterface>* foo = setup.client.get();
-    foo->initThreadMap();
-    setup.server->m_impl->m_fn = [] {};
-
-    EventLoop& loop = *setup.server->m_context.connection->m_loop;
-    loop.testing_hook_makethread = [&] {
-        // Use disconnect_later to queue the disconnect, because the makethread
-        // hook is called on the event loop thread. The disconnect should happen
-        // as soon as the event loop is idle.
-        setup.server_disconnect_later();
-    };
-    loop.testing_hook_makethread_created = [&] {
-        // Sleep to allow event loop to run and process the queued disconnect
-        // before the worker thread starts waiting.
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    };
-
-    bool disconnected{false};
-    try {
-        foo->callFnAsync();
-    } catch (const std::runtime_error& e) {
-        KJ_EXPECT(std::string_view{e.what()} == "IPC client method call interrupted by disconnect.");
-        disconnected = true;
-    }
-    KJ_EXPECT(disconnected);
 }
 
 KJ_TEST("Calling async IPC method, with server disconnect racing the call")
 {
-    // Regression test for bitcoin/bitcoin#34777 heap-use-after-free where
-    // an async request is canceled before it starts to execute.
-    //
-    // Use testing_hook_async_request_start to trigger a disconnect from the
-    // worker thread as soon as it begins to execute an async request. Without
-    // the bugfix, the worker thread would trigger a SIGSEGV after this by
-    // calling call_context.getParams().
     TestSetup setup;
     ProxyClient<messages::FooInterface>* foo = setup.client.get();
-    foo->initThreadMap();
     setup.server->m_impl->m_fn = [] {};
 
     EventLoop& loop = *setup.server->m_context.connection->m_loop;
     loop.testing_hook_async_request_start = [&] {
         setup.server_disconnect();
-        // Sleep is necessary to let the event loop fully clean up after the
-        // disconnect and trigger the SIGSEGV.
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     };
 
@@ -400,18 +330,8 @@ KJ_TEST("Calling async IPC method, with server disconnect racing the call")
 
 KJ_TEST("Calling async IPC method, with server disconnect after cleanup")
 {
-    // Regression test for bitcoin/bitcoin#34782 stack-use-after-return where
-    // an async request is canceled after it finishes executing but before the
-    // response is sent.
-    //
-    // Use testing_hook_async_request_done to trigger a disconnect from the
-    // worker thread after it executes an async request but before it returns.
-    // Without the bugfix, the m_on_cancel callback would be called at this
-    // point, accessing the cancel_mutex stack variable that had gone out of
-    // scope.
     TestSetup setup;
     ProxyClient<messages::FooInterface>* foo = setup.client.get();
-    foo->initThreadMap();
     setup.server->m_impl->m_fn = [] {};
 
     EventLoop& loop = *setup.server->m_context.connection->m_loop;
@@ -431,44 +351,32 @@ KJ_TEST("Make simultaneous IPC calls on single remote thread")
 {
     TestSetup setup;
     ProxyClient<messages::FooInterface>* foo = setup.client.get();
-    std::promise<void> signal;
 
-    foo->initThreadMap();
-    // Use callFnAsync() to get the client to set up the request_thread
-    // that will be used for the test.
     setup.server->m_impl->m_fn = [&] {};
     foo->callFnAsync();
-    ThreadContext& tc{g_thread_context};
-    Thread::Client *callback_thread, *request_thread;
-    foo->m_context.loop->sync([&] {
-        Lock lock(tc.waiter->m_mutex);
-        callback_thread = &tc.callback_threads.at(foo->m_context.connection)->m_client;
-        request_thread = &tc.request_threads.at(foo->m_context.connection)->m_client;
-    });
 
-    // Call callIntFnAsync 3 times with n=100, 200, 300
     std::atomic<int> expected = 100;
-
     setup.server->m_impl->m_int_fn = [&](int n) {
         assert(n == expected);
         expected += 100;
         return n;
     };
 
+    // Make three concurrent callIntFnAsync calls with n=100, 200, 300.
+    // They share the same server worker thread (same clientThreadId) so they
+    // must execute in the order sent.
+    ThreadContext& tc{g_thread_context};
+    uint64_t client_thread_id = tc.thread_id;
     auto client{foo->m_client};
     std::atomic<size_t> running{3};
-    foo->m_context.loop->sync([&]
-    {
-        for (size_t i = 0; i < running; i++)
-        {
+    foo->m_context.loop->sync([&] {
+        for (size_t i = 0; i < running; i++) {
             auto request{client.callIntFnAsyncRequest()};
-            auto context{request.initContext()};
-            context.setCallbackThread(*callback_thread);
-            context.setThread(*request_thread);
-            request.setArg(100 * (i+1));
+            request.initContext().setClientThreadId(client_thread_id);
+            request.setArg(100 * (i + 1));
             foo->m_context.loop->m_task_set->add(request.send().then(
                 [&running, &tc, i](auto&& results) {
-                    assert(results.getResult() == static_cast<int32_t>(100 * (i+1)));
+                    assert(results.getResult() == static_cast<int32_t>(100 * (i + 1)));
                     running -= 1;
                     tc.waiter->m_cv.notify_all();
                 }));

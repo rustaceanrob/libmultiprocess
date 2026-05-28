@@ -15,7 +15,7 @@ $Proxy.include("printer.h");
 $Proxy.includeTypes("types.h");
 
 interface InitInterface $Proxy.wrap("Init") {
-    construct @0 (threadMap: Proxy.ThreadMap) -> (threadMap :Proxy.ThreadMap);
+    construct @0 () -> ();
     makeCalculator @1 (context :Proxy.Context, print :Printer.PrinterInterface) -> (result :Calculator.CalculatorInterface);
     makePrinter @2 (context :Proxy.Context) -> (result :Printer.PrinterInterface);
 }

@@ -7,7 +7,6 @@
 #include <mp/proxy-io.h>
 #include <mp/proxy-types.h>
 #include <mp/proxy.capnp.h>
-#include <mp/type-threadmap.h>
 #include <mp/util.h>
 
 #include <atomic>
@@ -324,120 +323,59 @@ bool EventLoop::done() const
     return m_num_clients == 0 && m_async_fns->empty();
 }
 
-std::tuple<ConnThread, bool> SetThread(GuardedRef<ConnThreads> threads, Connection* connection, const std::function<Thread::Client()>& make_thread)
-{
-    assert(std::this_thread::get_id() == connection->m_loop->m_thread_id);
-    ConnThread thread;
-    bool inserted;
-    {
-        const Lock lock(threads.mutex);
-        std::tie(thread, inserted) = threads.ref.try_emplace(connection);
-    }
-    if (inserted) {
-        thread->second.emplace(make_thread(), connection, /* destroy_connection= */ false);
-        thread->second->m_disconnect_cb = connection->addSyncCleanup([threads, thread] {
-            // Note: it is safe to use the `thread` iterator in this cleanup
-            // function, because the iterator would only be invalid if the map entry
-            // was removed, and if the map entry is removed the ProxyClient<Thread>
-            // destructor unregisters the cleanup.
 
-            // Connection is being destroyed before thread client is, so reset
-            // thread client m_disconnect_cb member so thread client destructor does not
-            // try to unregister this callback after connection is destroyed.
-            thread->second->m_disconnect_cb.reset();
-
-            // Remove connection pointer about to be destroyed from the map
-            const Lock lock(threads.mutex);
-            threads.ref.erase(thread);
-        });
-    }
-    return {thread, inserted};
-}
-
-ProxyClient<Thread>::~ProxyClient()
-{
-    // If thread is being destroyed before connection is destroyed, remove the
-    // cleanup callback that was registered to handle the connection being
-    // destroyed before the thread being destroyed.
-    if (m_disconnect_cb) {
-        // Remove disconnect callback on the event loop thread with
-        // loop->sync(), so if the connection is broken there is not a race
-        // between this thread trying to remove the callback and the disconnect
-        // handler attempting to call it.
-        m_context.loop->sync([&]() {
-            if (m_disconnect_cb) {
-                m_context.connection->removeSyncCleanup(*m_disconnect_cb);
-            }
-        });
-    }
-}
-
-ProxyServer<Thread>::ProxyServer(Connection& connection, ThreadContext& thread_context, std::thread&& thread)
+WorkerThread::WorkerThread(Connection& connection, ThreadContext& thread_context, std::thread&& thread)
     : m_loop{*connection.m_loop}, m_thread_context(thread_context), m_thread(std::move(thread))
 {
     assert(m_thread_context.waiter.get() != nullptr);
 }
 
-ProxyServer<Thread>::~ProxyServer()
+WorkerThread::~WorkerThread()
 {
     if (!m_thread.joinable()) return;
-    // Stop async thread and wait for it to exit. Need to wait because the
-    // m_thread handle needs to outlive the thread to avoid "terminate called
-    // without an active exception" error. An alternative to waiting would be
-    // detach the thread, but this would introduce nondeterminism which could
-    // make code harder to debug or extend.
+    // Stop the thread and wait for it to exit.
     assert(m_thread_context.waiter.get());
     std::unique_ptr<Waiter> waiter;
     {
         const Lock lock(m_thread_context.waiter->m_mutex);
-        //! Reset thread context waiter pointer, as shutdown signal for done
-        //! lambda passed as waiter->wait() argument in makeThread code below.
+        // Reset waiter pointer as shutdown signal for the wait() loop in the
+        // thread body (see makeWorkerThread).
         waiter = std::move(m_thread_context.waiter);
-        //! Assert waiter is idle. This destructor shouldn't be getting called if it is busy.
         assert(!waiter->m_fn);
-        // Clear client maps now to avoid deadlock in m_thread.join() call
-        // below. The maps contain Thread::Client objects that need to be
-        // destroyed from the event loop thread (this thread), which can't
-        // happen if this thread is busy calling join.
-        m_thread_context.request_threads.clear();
-        m_thread_context.callback_threads.clear();
-        //! Ping waiter.
         waiter->m_cv.notify_all();
     }
     m_thread.join();
 }
 
-kj::Promise<void> ProxyServer<Thread>::getName(GetNameContext context)
+//! Create a new WorkerThread and register it in connection.m_thread_assignments
+//! for the given clientThreadId. Called lazily from PassField (server side) and
+//! from CustomBuildField (client side).
+WorkerThread& MakeWorkerThread(Connection& connection, uint64_t client_thread_id)
 {
-    context.getResults().setResult(m_thread_context.thread_name);
-    return kj::READY_NOW;
-}
-
-ProxyServer<ThreadMap>::ProxyServer(Connection& connection) : m_connection(connection) {}
-
-kj::Promise<void> ProxyServer<ThreadMap>::makeThread(MakeThreadContext context)
-{
-    EventLoop& loop{*m_connection.m_loop};
-    if (loop.testing_hook_makethread) loop.testing_hook_makethread();
-    const std::string from = context.getParams().getName();
-    std::promise<ThreadContext*> thread_context;
-    std::thread thread([&loop, &thread_context, from]() {
-        g_thread_context.thread_name = ThreadName(loop.m_exe_name) + " (from " + from + ")";
+    EventLoop& loop{*connection.m_loop};
+    std::promise<ThreadContext*> thread_context_promise;
+    std::thread thread([&loop, &thread_context_promise, client_thread_id]() {
+        g_thread_context.thread_name = ThreadName(loop.m_exe_name) + " (client " + std::to_string(client_thread_id) + ")";
         g_thread_context.waiter = std::make_unique<Waiter>();
         Lock lock(g_thread_context.waiter->m_mutex);
-        thread_context.set_value(&g_thread_context);
-        if (loop.testing_hook_makethread_created) loop.testing_hook_makethread_created();
-        // Wait for shutdown signal from ProxyServer<Thread> destructor (signal
-        // is just waiter getting set to null.)
+        thread_context_promise.set_value(&g_thread_context);
         g_thread_context.waiter->wait(lock, [] { return !g_thread_context.waiter; });
     });
-    auto thread_server = kj::heap<ProxyServer<Thread>>(m_connection, *thread_context.get_future().get(), std::move(thread));
-    auto thread_client = m_connection.m_threads.add(kj::mv(thread_server));
-    context.getResults().setResult(kj::mv(thread_client));
-    return kj::READY_NOW;
+    ThreadContext& thread_context = *thread_context_promise.get_future().get();
+    auto worker = kj::refcounted<WorkerThread>(connection, thread_context, std::move(thread));
+    WorkerThread* ptr = worker.get();
+    connection.m_thread_assignments[client_thread_id] = ptr;
+    connection.m_thread_pool.push_back(std::move(worker));
+    return *ptr;
 }
 
 std::atomic<int> server_reqs{0};
+
+uint64_t NextClientThreadId()
+{
+    static std::atomic<uint64_t> counter{1};
+    return counter.fetch_add(1, std::memory_order_relaxed);
+}
 
 std::string LongThreadName(const char* exe_name)
 {

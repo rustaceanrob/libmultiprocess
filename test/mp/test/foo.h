@@ -70,7 +70,6 @@ public:
     int mapSize(const std::map<std::string, std::string>& map) { return map.size(); }
     FooStruct pass(FooStruct foo) { return foo; }
     void raise(FooStruct foo) { throw foo; }
-    void initThreadMap() {}
     int callback(FooCallback& callback, int arg) { return callback.call(arg); }
     int callbackUnique(std::unique_ptr<FooCallback> callback, int arg) { return callback->call(arg); }
     int callbackShared(std::shared_ptr<FooCallback> callback, int arg) { return callback->call(arg); } // NOLINT(performance-unnecessary-value-param)
