@@ -415,6 +415,17 @@ kj::Promise<void> ProxyServer<Thread>::getName(GetNameContext context)
 
 ProxyServer<ThreadMap>::ProxyServer(Connection& connection) : m_connection(connection) {}
 
+kj::Promise<void> ProxyServer<ThreadMap>::makePool(MakePoolContext context)
+{
+    if (m_connection.m_thread_pool) {
+        throw std::runtime_error("makePool called on connection with existing pool");
+    }
+    const auto& params = context.getParams();
+    m_connection.m_thread_pool.emplace(*m_connection.m_loop);
+    m_connection.m_thread_pool->start(params.getName(), params.getCount());
+    return kj::READY_NOW;
+}
+
 kj::Promise<void> ProxyServer<ThreadMap>::makeThread(MakeThreadContext context)
 {
     EventLoop& loop{*m_connection.m_loop};

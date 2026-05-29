@@ -201,21 +201,28 @@ auto PassField(Priority<1>, TypeList<>, ServerContext& server_context, const Fn&
     const auto& params = server_context.call_context.getParams();
     Context::Reader context_arg = Accessor::get(params);
     auto thread_client = context_arg.getThread();
-    auto result = server.m_context.connection->m_threads.getLocalServer(thread_client)
-        .then([&loop, invoke = kj::mv(invoke), req](const kj::Maybe<Thread::Server&>& perhaps) mutable {
-            // Assuming the thread object is found, pass it a pointer to the
-            // `invoke` lambda above which will invoke the function on that
-            // thread.
+    auto* connection = server.m_context.connection;
+    auto result = connection->m_threads.getLocalServer(thread_client)
+        .then([&loop, invoke = kj::mv(invoke), req, connection](const kj::Maybe<Thread::Server&>& perhaps) mutable {
+            // If the client specified a thread, dispatch to it directly.
             KJ_IF_MAYBE (thread_server, perhaps) {
                 auto& thread = static_cast<ProxyServer<Thread>&>(*thread_server);
                 MP_LOG(loop, Log::Debug)
                     << "IPC server post request  #" << req << " {" << thread.m_thread_context.thread_name << "}";
                 return thread.template post<typename ServerContext::CallContext>(std::move(invoke));
-            } else {
-                MP_LOG(loop, Log::Error)
-                    << "IPC server error request #" << req << ", missing thread to execute request";
-                throw std::runtime_error("invalid thread handle");
             }
+            // No thread specified — delegate to the connection's worker pool
+            // (populated by ThreadMap.makePool). The pool's shared work queue
+            // hands the task to whichever worker is idle next. Error if no
+            // pool is configured.
+            if (!connection->m_thread_pool) {
+                MP_LOG(loop, Log::Error)
+                    << "IPC server error request #" << req << ", no thread specified and no pool configured";
+                throw std::runtime_error("no thread specified and no pool configured");
+            }
+            MP_LOG(loop, Log::Debug)
+                << "IPC server post request  #" << req << " {pool}";
+            return connection->m_thread_pool->template post<typename ServerContext::CallContext>(std::move(invoke));
         });
     // Use connection m_canceler object to cancel the result promise if the
     // connection is destroyed. (By default Cap'n Proto does not cancel requests
