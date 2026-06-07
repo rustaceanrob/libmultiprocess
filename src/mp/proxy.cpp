@@ -456,4 +456,67 @@ kj::StringPtr KJ_STRINGIFY(Log v)
     }
     return "<Log?>";
 }
+
+void ThreadPool::start(const std::string& pool_name, std::size_t count)
+{
+    assert(count > 0);
+    Lock lock(m_mutex);
+    assert(!m_started);
+    assert(!m_stopped);
+    m_started = true;
+    m_size = count;
+    m_workers.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        m_workers.emplace_back([this, name = pool_name + "/pool/" + std::to_string(i)] {
+            workerLoop(name);
+        });
+    }
+}
+
+void ThreadPool::stop()
+{
+    std::vector<std::thread> joining;
+    {
+        Lock lock(m_mutex);
+        if (m_stopped) return;
+        m_stopped = true;
+        if (!m_started) return;
+        joining.swap(m_workers);
+    }
+    m_cv.notify_all();
+    for (auto& t : joining) {
+        assert(t.get_id() != std::this_thread::get_id());
+        t.join();
+    }
+}
+
+void ThreadPool::workerLoop(const std::string& worker_name)
+{
+    g_thread_context.thread_name = ThreadName(m_loop.m_exe_name) + " (from " + worker_name + ")";
+    g_thread_context.waiter = std::make_unique<Waiter>();
+
+    for (;;) {
+        kj::Function<void()> task;
+        {
+            Lock lock(m_mutex);
+            m_cv.wait(lock.m_lock, [&]() MP_REQUIRES(m_mutex) {
+                return m_stopped || !m_queue.empty();
+            });
+            if (m_queue.empty()) {
+                // Stopped and drained: exit.
+                assert(m_stopped);
+                break;
+            }
+            task = kj::mv(m_queue.front());
+            m_queue.pop();
+        }
+        task();
+    }
+
+    // Match the teardown order ProxyServer<Thread> uses: drop the Waiter
+    // last so any cross-thread observers see a stable thread-local state
+    // throughout task execution.
+    g_thread_context.waiter.reset();
+}
+
 } // namespace mp

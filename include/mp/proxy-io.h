@@ -6,6 +6,7 @@
 #define MP_PROXY_IO_H
 
 #include <mp/proxy.h>
+#include <mp/thread-pool.h>
 #include <mp/util.h>
 
 #include <mp/proxy.capnp.h>
@@ -791,6 +792,44 @@ kj::Promise<T> ProxyServer<Thread>::post(Fn&& fn)
     }).attach(kj::heap<CancelProbe>(cancel_monitor));
     m_thread_ready = kj::mv(ready.promise);
     return ret;
+}
+
+template <typename T, typename Fn>
+kj::Promise<T> ThreadPool::post(Fn&& fn)
+{
+    auto result = kj::newPromiseAndFulfiller<T>();
+    auto cancel_monitor_ptr = kj::heap<CancelMonitor>();
+    CancelMonitor& cancel_monitor = *cancel_monitor_ptr;
+    auto& loop = m_loop;
+    kj::Function<void()> task = [&loop, fn = std::forward<Fn>(fn),
+                                 cancel_monitor_ptr = kj::mv(cancel_monitor_ptr),
+                                 fulfiller = kj::mv(result.fulfiller)]() mutable {
+        std::optional<T> value;
+        kj::Maybe<kj::Exception> exception{
+            kj::runCatchingExceptions([&] { value.emplace(fn(*cancel_monitor_ptr)); })};
+        loop.sync([&value, &exception,
+                   cancel_monitor_ptr = kj::mv(cancel_monitor_ptr),
+                   fulfiller = kj::mv(fulfiller)]() mutable {
+            // Destroy CancelMonitor before fulfilling/rejecting so the
+            // CancelProbe destructor (which fires when the returned
+            // promise resolves) does not observe a stale monitor.
+            cancel_monitor_ptr = nullptr;
+            KJ_IF_MAYBE (e, exception) {
+                fulfiller->reject(kj::mv(*e));
+            } else {
+                fulfiller->fulfill(kj::mv(*value));
+            }
+        });
+    };
+    {
+        Lock lock(m_mutex);
+        if (m_stopped) {
+            return kj::Promise<T>(KJ_EXCEPTION(DISCONNECTED, "ThreadPool: post() after stop()"));
+        }
+        m_queue.emplace(kj::mv(task));
+    }
+    m_cv.notify_one();
+    return result.promise.attach(kj::heap<CancelProbe>(cancel_monitor));
 }
 
 //! Given stream file descriptor, make a new ProxyClient object to send requests

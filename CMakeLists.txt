@@ -151,6 +151,7 @@ set(MP_PUBLIC_HEADERS
   include/mp/proxy-io.h
   include/mp/proxy-types.h
   include/mp/proxy.h
+  include/mp/thread-pool.h
   include/mp/type-char.h
   include/mp/type-chrono.h
   include/mp/type-context.h
